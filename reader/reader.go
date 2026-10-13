@@ -13,6 +13,7 @@ import (
 	"github.com/gmrtd/gmrtd/cms"
 	"github.com/gmrtd/gmrtd/document"
 	"github.com/gmrtd/gmrtd/iso7816"
+	"github.com/gmrtd/gmrtd/oid"
 	"github.com/gmrtd/gmrtd/pace"
 	"github.com/gmrtd/gmrtd/passiveauth"
 	"github.com/gmrtd/gmrtd/password"
@@ -87,6 +88,7 @@ type Reader struct {
 	skipPace                    bool // skip PACE
 	skipImages                  bool // skip image DGs (DG2, DG7)
 	allowBacFallbackOnPaceError bool // permit BAC after a recorded PACE error
+	requireAuthenticDocument    bool // reject a read that did not establish an authentic document
 	aaChallenge                 []byte
 }
 
@@ -117,6 +119,90 @@ func (reader *Reader) AllowBacFallbackOnPaceError() {
 	reader.mu.Lock()
 	defer reader.mu.Unlock()
 	reader.allowBacFallbackOnPaceError = true
+}
+
+// RequireAuthenticDocument makes ReadDocument return an error when the read did not
+// establish an authentic document, i.e. when either:
+//
+//  1. the data is not trusted (Summary().DataTrusted is false: a failed passive
+//     authentication or a failed Document.Verify), or
+//  2. a chip-authentication method (AA, CA or PACE-CAM) was attempted and none
+//     verifiably succeeded (VerifiedChipAuthStatus() is CHIP_AUTH_STATUS_NONE).
+//
+// A document that offers no chip-authentication method passes as long as its data is
+// trusted, and a failure in one method is tolerated when another succeeds (AA fails but
+// CA succeeds, PACE-CAM succeeds but AA fails, ...). A method this library cannot perform
+// (e.g. an unsupported AA signature algorithm) is a failed attempt and fails the check.
+//
+// The default is unchanged. On rejection the returned error wraps the underlying error(s)
+// and the DocumentEx is still returned so callers can log what happened. Only AA with a
+// caller-supplied challenge proves the chip to a remote party; CA and PACE-CAM prove it
+// only to the reader that ran the session, so this check belongs in the reader.
+func (reader *Reader) RequireAuthenticDocument() {
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	reader.requireAuthenticDocument = true
+}
+
+// checkAuthenticDocument implements the RequireAuthenticDocument policy against the recorded
+// session state. It returns nil when the document is authentic (or offers no chip
+// authentication and its data is trusted).
+func checkAuthenticDocument(docEx *document.DocumentEx, allowBacFallbackOnPaceError bool) error {
+	if !docEx.Summary().DataTrusted {
+		if underlying := errors.Join(docEx.Session.DocumentVerifyErr, docEx.Session.PassiveAuthErr); underlying != nil {
+			return fmt.Errorf("data not trusted: %w", underlying)
+		}
+		return errors.New("data not trusted")
+	}
+
+	if chipAuthAttempted(&docEx.Session, allowBacFallbackOnPaceError) &&
+		docEx.Session.VerifiedChipAuthStatus() == document.CHIP_AUTH_STATUS_NONE {
+		if underlying := errors.Join(docEx.Session.ActiveAuthErr, docEx.Session.ChipAuthErr, docEx.Session.PaceErr); underlying != nil {
+			return fmt.Errorf("chip authentication attempted but none verifiably succeeded: %w", underlying)
+		}
+		return errors.New("chip authentication attempted but none verifiably succeeded")
+	}
+
+	return nil
+}
+
+// chipAuthAttempted reports whether any chip-authentication method (AA, CA or PACE-CAM) was
+// attempted during the read. A recorded result or error for a method counts as an attempt.
+func chipAuthAttempted(session *document.Session, allowBacFallbackOnPaceError bool) bool {
+	if session.ActiveAuthResult != nil || session.ActiveAuthErr != nil {
+		return true
+	}
+	if session.ChipAuthResult != nil || session.ChipAuthErr != nil {
+		return true
+	}
+	if session.PaceCamResult != nil {
+		return true
+	}
+	// With the default fail-closed PACE policy a failed PACE-CAM already aborts ReadDocument,
+	// so this only matters under AllowBacFallbackOnPaceError. A PACE-CAM configuration that was
+	// started and failed counts as an attempt; ErrPACEUnsupportedLocally does not, because no
+	// PACE command was sent. DoPACE records the selected OID on PaceResult even on error.
+	if allowBacFallbackOnPaceError && session.PaceErr != nil &&
+		!errors.Is(session.PaceErr, pace.ErrPACEUnsupportedLocally) &&
+		paceConfigWasCam(session.PaceResult) {
+		return true
+	}
+	return false
+}
+
+// paceConfigWasCam reports whether the selected PACE configuration was a CAM (Chip
+// Authentication Mapping) variant, which performs chip authentication as part of PACE.
+func paceConfigWasCam(result *document.PaceResult) bool {
+	if result == nil {
+		return false
+	}
+	switch result.Oid.String() {
+	case oid.OidPaceEcdhCamAesCbcCmac128.String(),
+		oid.OidPaceEcdhCamAesCbcCmac192.String(),
+		oid.OidPaceEcdhCamAesCbcCmac256.String():
+		return true
+	}
+	return false
 }
 
 // WithAAChallenge sets a caller-supplied 8-byte RND.IFD challenge for Active
@@ -204,6 +290,13 @@ func (reader *Reader) ReadDocument(password *password.Password, atr []byte, ats 
 	)
 	if err != nil {
 		return state.docEx, reader.nfc.ApduLog(), fmt.Errorf("[ReadDocument] runSteps error: %w", err)
+	}
+
+	// NB returns partial data (docEx, apduLog) alongside the error, so a caller can log why.
+	if reader.requireAuthenticDocument {
+		if err = checkAuthenticDocument(state.docEx, reader.allowBacFallbackOnPaceError); err != nil {
+			return state.docEx, reader.nfc.ApduLog(), fmt.Errorf("[ReadDocument] not an authentic document: %w", err)
+		}
 	}
 
 	reader.reportPhase(STATUS_PHASE_FINISHED)

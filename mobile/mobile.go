@@ -155,6 +155,7 @@ type Reader struct {
 	skipPace                    bool
 	skipImages                  bool
 	allowBacFallbackOnPaceError bool
+	requireAuthenticDocument    bool
 	aaChallenge                 []byte
 }
 
@@ -201,6 +202,17 @@ func (r *Reader) AllowBacFallbackOnPaceError() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.allowBacFallbackOnPaceError = true
+}
+
+// RequireAuthenticDocument makes ReadDocument return an error when the read did not
+// establish an authentic document: the data is not trusted, or a chip-authentication
+// method (AA, CA or PACE-CAM) was attempted and none verifiably succeeded. A document
+// that offers no chip-authentication method passes when its data is trusted. The default
+// is unchanged. See reader.Reader.RequireAuthenticDocument for the full contract.
+func (r *Reader) RequireAuthenticDocument() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.requireAuthenticDocument = true
 }
 
 // WithAAChallenge sets a caller-supplied 8-byte RND.IFD challenge for Active
@@ -280,6 +292,10 @@ func (r *Reader) ReadDocument(password *MrtdPassword, atr []byte, ats []byte) (d
 
 	if r.allowBacFallbackOnPaceError {
 		gmrtdReader.AllowBacFallbackOnPaceError()
+	}
+
+	if r.requireAuthenticDocument {
+		gmrtdReader.RequireAuthenticDocument()
 	}
 
 	if r.aaChallenge != nil {

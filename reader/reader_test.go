@@ -11,6 +11,7 @@ import (
 	"github.com/gmrtd/gmrtd/cms"
 	"github.com/gmrtd/gmrtd/document"
 	"github.com/gmrtd/gmrtd/iso7816"
+	"github.com/gmrtd/gmrtd/oid"
 	"github.com/gmrtd/gmrtd/pace"
 	"github.com/gmrtd/gmrtd/password"
 	"github.com/gmrtd/gmrtd/utils"
@@ -952,4 +953,103 @@ func TestReaderConcurrentAccess(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestCheckAuthenticDocument(t *testing.T) {
+	someErr := errors.New("step failed")
+	trustedPA := &document.PassiveAuthResult{Success: true}
+
+	tests := []struct {
+		name             string
+		session          document.Session
+		allowBacFallback bool
+		wantErr          bool
+	}{
+		{
+			name:    "data not trusted (no passive authentication)",
+			session: document.Session{},
+			wantErr: true,
+		},
+		{
+			name:    "data not trusted (document verify failed)",
+			session: document.Session{PassiveAuthResult: trustedPA, DocumentVerifyErr: someErr},
+			wantErr: true,
+		},
+		{
+			name:    "trusted, no chip authentication offered",
+			session: document.Session{PassiveAuthResult: trustedPA},
+			wantErr: false,
+		},
+		{
+			name:    "active authentication attempted and failed",
+			session: document.Session{PassiveAuthResult: trustedPA, ActiveAuthErr: someErr},
+			wantErr: true,
+		},
+		{
+			name:    "chip authentication attempted and failed",
+			session: document.Session{PassiveAuthResult: trustedPA, ChipAuthErr: someErr},
+			wantErr: true,
+		},
+		{
+			name: "active authentication failed but chip authentication succeeded",
+			session: document.Session{
+				PassiveAuthResult: trustedPA,
+				ActiveAuthErr:     someErr,
+				ChipAuthResult:    &document.ChipAuthResult{Success: true},
+			},
+			wantErr: false,
+		},
+		{
+			name: "PACE-CAM succeeded but active authentication failed",
+			session: document.Session{
+				PassiveAuthResult: &document.PassiveAuthResult{Success: true, CardSec: &document.PassiveAuth{}},
+				PaceCamResult:     &document.PaceCamResult{Success: true},
+				ActiveAuthErr:     someErr,
+			},
+			wantErr: false,
+		},
+		{
+			name: "PACE-CAM failed under BAC fallback",
+			session: document.Session{
+				PassiveAuthResult: trustedPA,
+				PaceErr:           someErr,
+				PaceResult:        &document.PaceResult{Oid: oid.OidPaceEcdhCamAesCbcCmac128},
+			},
+			allowBacFallback: true,
+			wantErr:          true,
+		},
+		{
+			name: "ErrPACEUnsupportedLocally is not a CAM attempt",
+			session: document.Session{
+				PassiveAuthResult: trustedPA,
+				PaceErr:           pace.ErrPACEUnsupportedLocally,
+				PaceResult:        &document.PaceResult{Oid: oid.OidPaceEcdhCamAesCbcCmac128},
+			},
+			allowBacFallback: true,
+			wantErr:          false,
+		},
+		{
+			name: "non-CAM PACE error is not a chip-authentication attempt",
+			session: document.Session{
+				PassiveAuthResult: trustedPA,
+				PaceErr:           someErr,
+				PaceResult:        &document.PaceResult{Oid: oid.OidPaceEcdhGmAesCbcCmac128},
+			},
+			allowBacFallback: true,
+			wantErr:          false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			docEx := &document.DocumentEx{Session: tc.session}
+			err := checkAuthenticDocument(docEx, tc.allowBacFallback)
+			if tc.wantErr && err == nil {
+				t.Errorf("checkAuthenticDocument() = nil, want error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("checkAuthenticDocument() = %v, want nil", err)
+			}
+		})
+	}
 }
